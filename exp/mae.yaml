@@ -1,0 +1,17 @@
+program: main_mse.py
+data_dir: /data2/wangchangmiao/liuxiaoshuai/openBHB
+save_dir:  /data2/wangchangmiao/liuxiaoshuai/csbrain/output
+model: resnet18
+epochs: 300
+batch_size: 32
+lr: 1e-4
+lr_decay: step
+lr_decay_rate: 0.9
+lr_decay_step: 10
+optimizer: adam
+momentum: 0.9
+weight_decay: 5e-5
+train_all: 1
+trial: 0
+tf: none
+kernel: rbf
