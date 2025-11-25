@@ -1,0 +1,22 @@
+program: main_infonce.py
+data_dir: /data2/wangchangmiao/liuxiaoshuai/openBHB
+save_dir:  /data2/wangchangmiao/liuxiaoshuai/csbrain/output
+model: resnet18
+epochs: 300
+batch_size: 8
+lr: 1e-4
+lr_decay: step
+lr_decay_rate: 0.9
+lr_decay_step: 10
+optimizer: adam
+momentum: 0.9
+weight_decay: 5e-5
+train_all: 1
+method: yaware
+kernel: gaussian
+sigma: 1
+trial: 0
+tf: none
+resume: /data2/wangchangmiao/liuxiaoshuai/csbrain/output/openbhb_models/resnet18_yaware_adam_tfnone_lr0.0001_step_step10_rate0.9_temp0.1_wd5e-05_bsz8_views2_trainall_True_kernel_gaussian_sigma1.0_trial0/weights.pth
+
+gpus: 7
