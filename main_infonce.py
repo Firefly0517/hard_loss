@@ -63,7 +63,7 @@ def parse_arguments():
     parser.add_argument('--tf', type=str, help='data augmentation', choices=['none', 'crop', 'cutout', 'all'], default='none')
     
     # Loss 
-    parser.add_argument('--method', type=str, help='loss function', choices=['supcon', 'yaware', 'threshold', 'expw', 'hardaware'], default='supcon')
+    parser.add_argument('--method', type=str, help='loss function', choices=['supcon', 'yaware', 'threshold', 'expw', 'hardaware', 'mse'], default='supcon')
     parser.add_argument('--kernel', type=str, help='Kernel function (not for supcon)', choices=['cauchy', 'gaussian', 'rbf'], default=None)
     parser.add_argument('--delta_reduction', type=str, help='use mean or sum to reduce 3d delta mask (only for method=threshold)', default='sum')
     parser.add_argument('--temp', type=float, help='loss temperature', default=0.1)
@@ -89,6 +89,14 @@ def parse_arguments():
                         type=str,
                         default=None,  # 默认值设为None，表示不加载偏置特征
                         help='Path to the biased features file (default: None, no features loaded)')
+
+    parser.add_argument(
+        '--run_name',
+        type=str,
+        default=None,
+        help='Custom run name (if set, overrides the auto-generated name)'
+    )
+
     opts = parser.parse_args()
 
     if opts.gpus is not None and opts.device.startswith('cuda'):
@@ -396,18 +404,21 @@ if __name__ == '__main__':
         kernel_name = f"{kernel_name}_sigma{opts.sigma}"
     elif opts.kernel == 'cauchy':
         kernel_name = f"{kernel_name}_gamma{opts.sigma}"
-    
-    run_name = (f"{model_name}_{method_name}_"
-                f"{optimizer_name}_"
-                f"tf{opts.tf}_"
-                f"lr{opts.lr}_{opts.lr_decay}_step{opts.lr_decay_step}_rate{opts.lr_decay_rate}_"
-                f"temp{opts.temp}_"
-                f"wd{opts.weight_decay}_"
-                f"bsz{opts.batch_size}_views{opts.n_views}_"
-                f"trainall_{opts.train_all}_"
-                f"kernel_{kernel_name}_"
-                # f"f{opts.alpha}_lambd{opts.lambd}_"
-                f"trial{opts.trial}")
+
+    if opts.run_name is not None:
+        run_name = opts.run_name
+    else:
+        run_name = (f"{model_name}_{method_name}_"
+                    f"{optimizer_name}_"
+                    f"tf{opts.tf}_"
+                    f"lr{opts.lr}_{opts.lr_decay}_step{opts.lr_decay_step}_rate{opts.lr_decay_rate}_"
+                    f"temp{opts.temp}_"
+                    f"wd{opts.weight_decay}_"
+                    f"bsz{opts.batch_size}_views{opts.n_views}_"
+                    f"trainall_{opts.train_all}_"
+                    f"kernel_{kernel_name}_"
+                    f"trial{opts.trial}")
+
     tb_dir = os.path.join(opts.save_dir, "tensorboard", run_name)
     save_dir = os.path.join(opts.save_dir, f"openbhb_models", run_name)
     ensure_dir(tb_dir)

@@ -91,25 +91,28 @@ class HardnessAwareKernelizedSupCon(nn.Module):
         sim = torch.div(torch.matmul(features, features.T), self.temperature)
 
         # mask out self-contrast
-        logits_mask = torch.ones_like(sim) - torch.eye(N, device=device)
-        exp_sim = torch.exp(sim) * logits_mask
+        logits_mask = 1 - torch.eye(N, device=device)
+        w_hat = w_hat * logits_mask
 
-        # compute log-prob
-        pos = exp_sim * w_hat  # positive contribution
-        neg = exp_sim * (1 - w_hat)  # negative contribution
-        denom = (pos + neg).sum(1, keepdim=True) + self.eps
+        # 对比学习：分母包含所有 j≠i
+        sim = torch.matmul(features, features.T) / self.temperature
 
-        # numerator also weighted because positives are weighted
-        positive_sim = sim * w_hat
+        # 数值稳定性：减去最大值
+        logits_max, _ = torch.max(sim, dim=1, keepdim=True)
+        logits = sim - logits_max.detach()
 
-        log_prob = positive_sim - torch.log(denom)
+        # 计算分母
+        exp_logits = torch.exp(logits) * logits_mask
+        log_denom = torch.log(exp_logits.sum(1, keepdim=True) + self.eps)
 
-        # positive mask (weighted)
-        pos_mask = w_hat * logits_mask
+        # log p(i,j) for all j≠i
+        log_prob = logits - log_denom  # [N, N]
 
-        # final contrastive regression loss
-        mean_log_prob_pos = (pos_mask * log_prob).sum(1) / (pos_mask.sum(1) + self.eps)
-        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
+        # 加权平均
+        weighted_log_prob = w_hat * log_prob
+        mean_log_prob = weighted_log_prob.sum(1) / w_hat.sum(1).clamp(min=self.eps)
+
+        loss = -(self.temperature / self.base_temperature) * mean_log_prob
         return loss.mean()
 
 
