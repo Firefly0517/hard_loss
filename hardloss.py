@@ -40,79 +40,56 @@ class HardnessAwareKernelizedSupCon(nn.Module):
         return dist
 
     def forward(self, features, labels):
-        """
-        Args:
-            features: [bsz, n_views, dim] -> 模型输出的特征张量，维度为[批次大小, 视图数, 特征维度]
-                  （n_views：数据增强生成的多视图，如同一图像的不同裁剪/旋转）
-            labels: [bsz, 1] -> 连续标签张量，维度为[批次大小, 1]
-        """
         device = features.device
 
-        if len(features.shape) != 3: # 输入维度检测校验
-            raise ValueError('`features` needs to be [bsz, n_views, n_feats],'
-                             '3 dimensions are required')
+        if features.dim() != 3:
+            raise ValueError("features must be [bsz, n_views, dim]")
 
         bsz, n_views, dim = features.shape
-        features = F.normalize(features, dim=-1) # L2归一化
+        labels = labels.view(bsz, 1)
 
-        # merge views
-        features = torch.cat(torch.unbind(features, dim=1), dim=0)  # [bsz*n_views, dim]
-        labels = labels.view(-1, 1)
+        # normalize & flatten views
+        features = F.normalize(features, dim=-1)
+        feats = torch.cat(torch.unbind(features, dim=1), dim=0)  # [N, D]
+        labels = labels.repeat(n_views, 1)  # [N, 1]
+        N = feats.size(0)
 
-        if labels.shape[0] != bsz:
-            raise ValueError('Num of labels does not match num of features')
+        # mask self-contrast
+        logits_mask = torch.ones((N, N), device=device)
+        logits_mask.fill_diagonal_(0.)
 
-        labels = labels.repeat(n_views, 1)
-        N = labels.size(0)
+        # -------- y-aware kernel weight (positives only) --------
+        w = self.kernel(labels).clamp(0., 1.)  # [N, N]
 
-        # compute label kernel weights
-        w = self.kernel(labels)  # [N, N], e.g. RBF kernel
-        w = w.clamp(0., 1.)
+        # -------- hardness: inconsistency u = d_z - d_y --------
+        d_y = torch.abs(labels - labels.T)
+        d_y = d_y / (d_y.max() + self.eps)
 
-        # ----- compute distances -----
-        d_y = torch.abs(labels - labels.T)  # label-space distance
-        d_y = d_y / (d_y.max() + self.eps)  # normalize
+        d_z = self.pairwise_distance(feats)
+        d_z = d_z / (d_z.max() + self.eps)
 
-        d_z = self.pairwise_distance(features)  # representation-space distance
-        d_z = d_z / (d_z.max() + self.eps)      # normalize
+        u = torch.clamp(d_z - d_y, -self.hmax, self.hmax)
 
-        # inconsistency u_{i,k} = d_z - d_y
-        u = d_z - d_y
-        u = torch.clamp(u, -self.hmax, self.hmax)
+        # -------- hard-aware positive modulation --------
+        m = 1.0 + self.lambda_hard * F.relu(u)
 
-        # compute difficulty multipliers
-        m = 1.0 + self.lambda_hard * F.relu(u)   # hard positive
-        n = 1.0 + self.lambda_hard * F.relu(-u)  # hard negative
-
-        # adjusted weight
-        w_hat = w * m + (1 - w) * n
-
-        # similarity matrix
-        sim = torch.div(torch.matmul(features, features.T), self.temperature)
-
-        # mask out self-contrast
-        logits_mask = 1 - torch.eye(N, device=device)
-        w_hat = w_hat * logits_mask
-
-        # 对比学习：分母包含所有 j≠i
-        sim = torch.matmul(features, features.T) / self.temperature
-
-        # 数值稳定性：减去最大值
+        # final positive weights (THIS is the key)
+        # w_pos = (w * m) * logits_mask
+        w_pos = w
+        # -------- InfoNCE logits (standard) --------
+        sim = torch.matmul(feats, feats.T) / self.temperature
         logits_max, _ = torch.max(sim, dim=1, keepdim=True)
         logits = sim - logits_max.detach()
 
-        # 计算分母
         exp_logits = torch.exp(logits) * logits_mask
-        log_denom = torch.log(exp_logits.sum(1, keepdim=True) + self.eps)
-
-        # log p(i,j) for all j≠i
+        log_denom = torch.log(exp_logits.sum(dim=1, keepdim=True) + self.eps)
         log_prob = logits - log_denom  # [N, N]
 
-        # 加权平均
-        weighted_log_prob = w_hat * log_prob
-        mean_log_prob = weighted_log_prob.sum(1) / w_hat.sum(1).clamp(min=self.eps)
+        # -------- y-aware expectation over positives --------
+        w_pos_sum = w_pos.sum(dim=1).clamp(min=self.eps)
+        mean_log_prob_pos = (w_pos * log_prob).sum(dim=1) / w_pos_sum
 
-        loss = -(self.temperature / self.base_temperature) * mean_log_prob
+        loss = -(self.temperature / self.base_temperature) * mean_log_prob_pos
         return loss.mean()
 
 
