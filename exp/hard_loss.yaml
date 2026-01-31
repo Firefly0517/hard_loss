@@ -3,7 +3,7 @@ data_dir: /data2/wangchangmiao/liuxiaoshuai/openBHB
 save_dir:  /data2/wangchangmiao/liuxiaoshuai/csbrain/output
 model: resnet18
 epochs: 300
-batch_size: 8
+batch_size: 32
 lr: 1e-3
 lr_decay: step
 lr_decay_rate: 0.9
@@ -22,5 +22,5 @@ save_freq: 10
 lambda_hard: 1.0  # 难样本权重增强幅度
 hmax: 1.0  # 截断阈值，控制u的范围
 distance_metric: cosine  # 嵌入空间距离度量
-gpus: 6
-run_name: hardloss_test1
+gpus: 7
+run_name: hardloss_test2

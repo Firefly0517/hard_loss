@@ -21,4 +21,3 @@ resume: /data2/wangchangmiao/liuxiaoshuai/csbrain/output/openbhb_models/y_aware_
 
 gpus: 1
 run_name: y_aware_experiment_rbf
-# amp: 1
