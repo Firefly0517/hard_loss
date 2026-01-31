@@ -9,15 +9,16 @@ import argparse
 import models
 import losses
 import time
+import sys
 
 import torch.utils.tensorboard
 
 from torchvision import transforms
-from util import AverageMeter, MAE, ensure_dir, set_seed, arg2bool, save_model
+from util import AverageMeter, MAE, ensure_dir, set_seed, arg2bool, save_model, Logger
 from util import warmup_learning_rate, adjust_learning_rate
 from util import compute_age_mae, compute_site_ba
 from data import FeatureExtractor, OpenBHB, bin_age
-from data.transforms import Crop, Pad, Cutout
+from data.transforms import Crop, Pad, Cutout, isotropic_resample_to_128
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Augmentation for multiview",
@@ -61,7 +62,25 @@ def parse_arguments():
                         default=None,  # 默认值设为None，表示不加载偏置特征
                         help='Path to the biased features file (default: None, no features loaded)')
 
+    parser.add_argument('--gpus', type=str, help='GPU ids to use (comma-separated, e.g. 0,1)', default='0')
+    parser.add_argument('--resume', type=str, default=None,
+                        help='path to checkpoint')
+    parser.add_argument('--test_only', type=arg2bool, default=False)
+    parser.add_argument('--run_name', type=str, default=None)
+
+
     opts = parser.parse_args()
+
+
+    if opts.gpus is not None and opts.device.startswith('cuda'):
+        os.environ["CUDA_VISIBLE_DEVICES"] = opts.gpus
+        # 校验GPU是否可用
+        available_gpus = torch.cuda.device_count()
+        if available_gpus == 0:
+            print("Warning: No GPU available, falling back to CPU")
+            opts.device = 'cpu'
+        else:
+            print(f"Using GPUs: {opts.gpus} (total available: {available_gpus})")
 
     if opts.batch_size > 256:
         print("Forcing warm")
@@ -92,7 +111,7 @@ def parse_arguments():
 
 def get_transforms(opts):
     # selector = FeatureExtractor("vbm")
-    selector = FeatureExtractor("quasiraw")
+    selector = FeatureExtractor("quasiraw") # T1
     if opts.tf == 'none':
         aug = transforms.Lambda(lambda x: x)
 
@@ -111,20 +130,39 @@ def get_transforms(opts):
             Crop((1, 121, 128, 121), type="random"),
             Pad((1, 128, 128, 128))
         ])
-    
-    T_pre = transforms.Lambda(lambda x: selector.transform(x))
+
+    center_crop_128 = Crop(
+        shape=(1, 128, 128, 128),
+        type="center"
+    )
+
     T_train = transforms.Compose([
-        T_pre,
-        aug,
+        transforms.Lambda(lambda x: selector.transform(x)),  # (1,182,218,182)
+        transforms.Lambda(lambda x: isotropic_resample_to_128(x)),  # (1,128,128,128)
         transforms.Lambda(lambda x: torch.from_numpy(x).float()),
-        transforms.Normalize(mean=0.0, std=1.0)
+        transforms.Normalize(mean=0.0, std=1.0),
     ])
 
     T_test = transforms.Compose([
-        T_pre,
+        transforms.Lambda(lambda x: selector.transform(x)),
+        transforms.Lambda(lambda x: isotropic_resample_to_128(x)),
         transforms.Lambda(lambda x: torch.from_numpy(x).float()),
-        transforms.Normalize(mean=0.0, std=1.0)
+        transforms.Normalize(mean=0.0, std=1.0),
     ])
+
+    # T_pre = transforms.Lambda(lambda x: selector.transform(x))
+    # T_train = transforms.Compose([
+    #     T_pre,
+    #     aug,
+    #     transforms.Lambda(lambda x: torch.from_numpy(x).float()),
+    #     transforms.Normalize(mean=0.0, std=1.0)
+    # ])
+    #
+    # T_test = transforms.Compose([
+    #     T_pre,
+    #     transforms.Lambda(lambda x: torch.from_numpy(x).float()),
+    #     transforms.Normalize(mean=0.0, std=1.0)
+    # ])
 
     return T_train, T_test
 
@@ -151,7 +189,10 @@ def load_data(opts):
 
     train_loader = torch.utils.data.DataLoader(train_dataset, batch_size=opts.batch_size, shuffle=True, 
                                                num_workers=8, persistent_workers=True)
-   
+    train_loader_score = torch.utils.data.DataLoader(
+        OpenBHB(opts.data_dir, train=True, internal=True, transform=T_train),
+        batch_size=opts.batch_size, shuffle=True, num_workers=8,
+        persistent_workers=True)
     test_internal = torch.utils.data.DataLoader(OpenBHB(opts.data_dir, train=False, internal=True, transform=T_test), 
                                                 batch_size=opts.batch_size, shuffle=False, num_workers=8,
                                                 persistent_workers=True)
@@ -159,7 +200,7 @@ def load_data(opts):
                                                 batch_size=opts.batch_size, shuffle=False, num_workers=8,
                                                 persistent_workers=True)
 
-    return train_loader, test_internal, test_external
+    return train_loader, train_loader_score, test_internal, test_external
 
 def load_model(opts):
     if 'resnet' in opts.model:
@@ -269,10 +310,10 @@ def test(test_loader, model, criterion, opts, epoch):
         mae.update(output, labels)
 
         batch_time.update(time.time() - t1)
-        eta = batch_time.avg * (len(train_loader) - idx)
+        eta = batch_time.avg * (len(test_loader) - idx)
 
         if (idx + 1) % opts.print_freq == 0:
-            print(f"Test: [{epoch}][{idx + 1}/{len(train_loader)}]:\t"
+            print(f"Test: [{epoch}][{idx + 1}/{len(test_loader)}]:\t"
                   f"BT {batch_time.avg:.3f}\t"
                   f"ETA {datetime.timedelta(seconds=eta)}\t"
                   f"loss {loss.avg:.3f}\t"
@@ -282,38 +323,131 @@ def test(test_loader, model, criterion, opts, epoch):
 
     return loss.avg, mae.avg
 
+def evaluate(model, train_loader, test_int_loader, test_ext_loader, opts, epoch, writer):
+    """执行评估并返回指标"""
+    print(f"\nEvaluating epoch {epoch}...")
+    # 计算年龄MAE
+    mae_train, mae_int, mae_ext = compute_age_mae(
+        model, train_loader, test_int_loader, test_ext_loader, opts
+    )
+    # 计算站点BA
+    ba_train, ba_int, ba_ext = compute_site_ba(
+        model, train_loader, test_int_loader, test_ext_loader, opts
+    )
+    # 计算挑战指标
+    challenge_metric = ba_int ** 0.3 * mae_ext
+
+    # 打印指标
+    print(f"Age MAE: train={mae_train:.4f}, internal={mae_int:.4f}, external={mae_ext:.4f}")
+    print(f"Site BA: train={ba_train:.4f}, internal={ba_int:.4f}, external={ba_ext:.4f}")
+    print(f"Challenge score: {challenge_metric:.4f}\n")
+
+    # 记录TensorBoard
+    if writer is not None:
+        writer.add_scalar("train/mae", mae_train, epoch)
+        writer.add_scalar("test/mae_int", mae_int, epoch)
+        writer.add_scalar("test/mae_ext", mae_ext, epoch)
+        writer.add_scalar("train/site_ba", ba_train, epoch)
+        writer.add_scalar("test/ba_int", ba_int, epoch)
+        writer.add_scalar("test/ba_ext", ba_ext, epoch)
+        writer.add_scalar("test/score", challenge_metric, epoch)
+
+    return mae_train, mae_int, mae_ext, ba_train, ba_int, ba_ext, challenge_metric
+
+
+def load_checkpoint(opts, model, optimizer=None):
+    """加载 checkpoint，自动处理单卡/多卡权重"""
+    if not os.path.exists(opts.resume):
+        raise FileNotFoundError(f"Checkpoint not found: {opts.resume}")
+
+    checkpoint = torch.load(opts.resume, map_location=opts.device)
+    state_dict = checkpoint['model']
+    model_state = model.state_dict()
+
+    # 自动适配单卡/多卡权重
+    new_state_dict = {}
+    for k, v in state_dict.items():
+        # 情况1: 保存的是多卡权重（带module.），加载到单卡模型
+        if k.startswith('module.') and k[7:] in model_state:
+            new_state_dict[k[7:]] = v
+        # 情况2: 保存的是单卡权重，加载到多卡模型
+        elif not k.startswith('module.') and f"module.{k}" in model_state:
+            new_state_dict[f"module.{k}"] = v
+        # 情况3: 权重键完全匹配
+        elif k in model_state:
+            new_state_dict[k] = v
+        else:
+            print(f"Warning: Ignoring unexpected key {k}")
+
+    # 加载模型权重
+    model.load_state_dict(new_state_dict, strict=False)
+    print(f"Loaded model weights from {opts.resume}")
+
+    # 加载优化器和epoch（如果需要）
+    start_epoch = 1
+    if optimizer is not None and 'optimizer' in checkpoint:
+        optimizer.load_state_dict(checkpoint['optimizer'])
+        print("Loaded optimizer state")
+    if 'epoch' in checkpoint:
+        start_epoch = checkpoint['epoch'] + 1  # 从下一个epoch开始
+        print(f"Resuming from epoch {start_epoch}")
+
+    return start_epoch
+
+
+
 if __name__ == '__main__':
     opts = parse_arguments()
     
     set_seed(opts.trial)
 
-    train_loader, test_loader_int, test_loader_ext = load_data(opts)
+    train_loader, train_loader_score, test_loader_int, test_loader_ext = load_data(opts)
+
+
+
     model, criterion = load_model(opts)
     optimizer = load_optimizer(model, opts)
 
     model_name = opts.model
     if opts.warm:
         model_name = f"{model_name}_warm"
-    
 
-    run_name = (f"{model_name}_{opts.method}_"
-                f"{opts.optimizer}_"
-                f"tf_{opts.tf}_"
-                f"lr{opts.lr}_{opts.lr_decay}_step{opts.lr_decay_step}_rate{opts.lr_decay_rate}_"
-                f"wd{opts.weight_decay}_"
-                f"trainall_{opts.train_all}_"
-                f"bsz{opts.batch_size}_"
-                f"trial{opts.trial}")
+    if opts.run_name is not None:
+        run_name = opts.run_name
+    else:
+        run_name = (f"{model_name}_{opts.method}_"
+                    f"{opts.optimizer}_"
+                    f"tf{opts.tf}_"
+                    f"lr{opts.lr}_{opts.lr_decay}_step{opts.lr_decay_step}_rate{opts.lr_decay_rate}_"
+                    f"temp{opts.temp}_"
+                    f"wd{opts.weight_decay}_"
+                    f"bsz{opts.batch_size}_"
+                    f"trainall_{opts.train_all}_"
+                    f"trial{opts.trial}")
+
     tb_dir = os.path.join(opts.save_dir, "tensorboard", run_name)
     save_dir = os.path.join(opts.save_dir, f"openbhb_models", run_name)
     ensure_dir(tb_dir)
     ensure_dir(save_dir)
 
+    log_file = os.path.join(save_dir, "run_log.txt")
+    logger = Logger(log_file)
+    # 重定向标准输出到日志（后续print会同时写入文件）
+    sys.stdout = logger
+
     opts.model_class = model.__class__.__name__
     opts.criterion = opts.method
     opts.optimizer_class = optimizer.__class__.__name__
 
-    # wandb.init(project="brain-age-prediction", config=opts, name=run_name, sync_tensorboard=True, tags=['to test'])
+    # wandb.init(project="brain-age-prediction", config=opts, name=run_name, sync_tensorboard=True,
+    #           settings=wandb.Settings(code_dir="/src"), tags=['to test'])
+    # wandb.run.log_code(root="/src", include_fn=lambda path: path.endswith(".py"))
+
+    print(f"Start time: {datetime.datetime.now()}")
+    print(f"Run name: {run_name}")
+    print(f"Using device: {opts.device}")
+    print(f"Using GPUs: {opts.gpus}")
+
     print('Config:', opts)
     print('Model:', model.__class__.__name__)
     print('Criterion:', opts.criterion)
@@ -323,10 +457,26 @@ if __name__ == '__main__':
     writer = torch.utils.tensorboard.writer.SummaryWriter(tb_dir)
     if opts.amp:
         print("Using AMP")
-    
+
+    start_epoch = 1
+    if opts.resume is not None:
+        start_epoch = load_checkpoint(opts, model, optimizer if not opts.test_only else None)
+
+    if opts.test_only:
+        print("Running in test-only mode")
+        evaluate(model, train_loader_score, test_loader_int, test_loader_ext, opts,
+                 epoch=start_epoch - 1, writer=writer)
+
+        writer.close()
+        logger.close()
+        sys.stdout = logger.console
+        exit(0)
+
+    print(f"Starting training for {opts.epochs} epochs")
+    best_score = float('inf')
     start_time = time.time()
     best_acc = 0.
-    for epoch in range(1, opts.epochs + 1):
+    for epoch in range(start_epoch, opts.epochs + 1):
         adjust_learning_rate(opts, optimizer, epoch)
 
         t1 = time.time()
@@ -350,40 +500,27 @@ if __name__ == '__main__':
               f"mae_int {mae_int:.3f} mae_ext {mae_ext:.3f}")
 
         if epoch % opts.save_freq == 0:
-            # save_file = os.path.join(save_dir, f"ckpt_epoch_{epoch}.pth")
-            # save_model(model, optimizer, opts, epoch, save_file)
-            mae_train, mae_int, mae_ext = compute_age_mae(model, train_loader, test_loader_int, test_loader_ext, opts)
-            
-            writer.add_scalar("train/mae", mae_train, epoch)
-            writer.add_scalar("test/mae_int", mae_int, epoch)
-            writer.add_scalar("test/mae_ext", mae_ext, epoch)
-            print("Age MAE:", mae_train, mae_int, mae_ext)
+            metrics = evaluate(model, train_loader_score, test_loader_int, test_loader_ext, opts, epoch, writer)
+            _, _, _, _, _, _, challenge_score = metrics
 
-            ba_train, ba_int, ba_ext = compute_site_ba(model, train_loader, test_loader_int, test_loader_ext, opts)
-            writer.add_scalar("train/site_ba", ba_train, epoch)
-            writer.add_scalar("test/ba_int", ba_int, epoch)
-            writer.add_scalar("test/ba_ext", ba_ext, epoch)
-            print("Site BA:", ba_train, ba_int, ba_ext)
+            # 保存模型
+            save_file = os.path.join(save_dir, f"ckpt_epoch_{epoch}.pth")
+            save_model(model, optimizer, opts, epoch, save_file)
+            print(f"Saved checkpoint to {save_file}")
 
-            challenge_metric = ba_int**0.3 * mae_ext
-            writer.add_scalar("test/score", challenge_metric, epoch)
-            print("Challenge score", challenge_metric)
+            # 保存最佳模型
+            if challenge_score < best_score:
+                best_score = challenge_score
+                best_file = os.path.join(save_dir, "best_ckpt.pth")
+                save_model(model, optimizer, opts, epoch, best_file)
+                print(f"Updated best checkpoint (score: {best_score:.4f})")
 
-        save_file = os.path.join(save_dir, f"weights.pth")
-        save_model(model, optimizer, opts, epoch, save_file)
-    
-    mae_train, mae_int, mae_ext = compute_age_mae(model, train_loader, test_loader_int, test_loader_ext, opts)
-    writer.add_scalar("train/mae", mae_train, epoch)
-    writer.add_scalar("test/mae_int", mae_int, epoch)
-    writer.add_scalar("test/mae_ext", mae_ext, epoch)
-    print("Age MAE:", mae_train, mae_int, mae_ext)
+        latest_file = os.path.join(save_dir, "latest_ckpt.pth")
+        save_model(model, optimizer, opts, epoch, latest_file)
 
-    ba_train, ba_int, ba_ext = compute_site_ba(model, train_loader, test_loader_int, test_loader_ext, opts)
-    writer.add_scalar("train/site_ba", ba_train, epoch)
-    writer.add_scalar("test/ba_int", ba_int, epoch)
-    writer.add_scalar("test/ba_ext", ba_ext, epoch)
-    print("Site BA:", ba_train, ba_int, ba_ext)
+    print("\nTraining completed. Running final evaluation...")
+    evaluate(model, train_loader_score, test_loader_int, test_loader_ext, opts, opts.epochs, writer)
 
-    challenge_metric = ba_int**0.3 * mae_ext
-    writer.add_scalar("test/score", challenge_metric, epoch)
-    print("Challenge score", challenge_metric)
+    writer.close()
+    logger.close()  # 关闭日志文件
+    sys.stdout = logger.console  # 恢复标准输出到控制台

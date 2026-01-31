@@ -172,7 +172,9 @@ class FeatureExtractor(BaseEstimator, TransformerMixin):
         if self.dtype in ("vbm", "quasiraw"):
             im = unmask(select_X, self.masks[self.dtype])
             select_X = im.get_fdata()
-            select_X = select_X.transpose(2, 0, 1)
+            # select_X = select_X.transpose(2, 0, 1)
+            # 注释select_X.transpose(2, 0, 1)  对应quasiraw数据集
+            # 不注释的话对应的是vbm
         select_X = select_X.reshape(self.MODALITIES[self.dtype]["shape"])
         # print('transformed.shape', select_X.shape)
         return select_X

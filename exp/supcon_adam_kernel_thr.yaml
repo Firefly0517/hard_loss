@@ -12,13 +12,13 @@ optimizer: adam
 momentum: 0.9
 weight_decay: 5e-5
 train_all: 1
-method: expw
+method: threshold
 kernel: rbf
 sigma: 1
 trial: 0
 tf: none
-resume: /data2/wangchangmiao/liuxiaoshuai/csbrain/output/openbhb_models/y_aware_experiment_rbf/latest_ckpt.pth
+# resume: /data2/wangchangmiao/liuxiaoshuai/csbrain/output/openbhb_models/y_aware_experiment/latest_ckpt.pth
 
 gpus: 1
-run_name: y_aware_experiment_rbf
+run_name: y_aware_experiment_thr
 # amp: 1

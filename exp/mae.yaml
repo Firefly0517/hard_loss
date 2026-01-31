@@ -15,3 +15,7 @@ train_all: 1
 trial: 0
 tf: none
 kernel: rbf
+gpus: 2
+resume: /data2/wangchangmiao/liuxiaoshuai/csbrain/output/openbhb_models/resnet18_mae_adam_tf_none_lr0.0001_step_step10_rate0.9_wd5e-05_trainall_True_bsz32_trial0/weights.pth
+
+run_name: mae_experiment

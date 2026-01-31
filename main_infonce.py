@@ -25,7 +25,7 @@ from util import compute_age_mae, compute_site_ba
 from data import FeatureExtractor, OpenBHB, bin_age
 from data.transforms import Crop, Pad, Cutout
 from main_mse import get_transforms
-
+from samples import export_from_loader
 
 def parse_arguments():
     parser = argparse.ArgumentParser(description="Weakly contrastive learning for brain age predictin",
@@ -302,6 +302,61 @@ def train(train_loader, model, infonce, optimizer, opts, epoch):
 
     return loss.avg, batch_time.avg, data_time.avg
 
+@torch.no_grad()
+def export_repr(model, loader, opts, save_path):
+    """
+    导出 representation，并用 linear probe 生成 y_hat
+    """
+    model.eval()
+
+    all_z = []
+    all_y = []
+
+    for images, labels, _ in loader:
+        # NViewTransform → single view
+        if isinstance(images, (list, tuple)):
+            images = images[0]
+
+        images = images.to(opts.device)
+        labels = labels.cpu().numpy()
+
+        # 处理 DataParallel
+        if hasattr(model, "module"):
+            encoder = model.module.encoder
+        else:
+            encoder = model.encoder
+
+        z = encoder(images)
+        z = z.cpu().numpy()
+
+        all_z.append(z)
+        all_y.append(labels)
+
+    Z = np.concatenate(all_z, axis=0)
+    Y = np.concatenate(all_y, axis=0)
+
+    # ===== 核心：linear probe 生成 y_hat =====
+    from sklearn.linear_model import LinearRegression
+    from sklearn.model_selection import KFold
+
+    y_hat = np.zeros_like(Y, dtype=np.float32)
+
+    kf = KFold(n_splits=5, shuffle=True, random_state=42)
+    for train_idx, test_idx in kf.split(Z):
+        reg = LinearRegression()
+        reg.fit(Z[train_idx], Y[train_idx])
+        y_hat[test_idx] = reg.predict(Z[test_idx])
+
+    np.savez(
+        save_path,
+        z=Z,
+        y=Y,
+        y_hat=y_hat
+    )
+
+    mae = np.mean(np.abs(y_hat - Y))
+    print(f"[INFO] Saved representations to {save_path}")
+    print(f"[INFO] Linear probe MAE = {mae:.3f}")
 
 def evaluate(model, train_loader, test_int_loader, test_ext_loader, opts, epoch, writer):
     """执行评估并返回指标"""
@@ -382,6 +437,19 @@ if __name__ == '__main__':
     set_seed(opts.trial)
 
     train_loader, train_loader_score, test_loader_int, test_loader_ext = load_data(opts)
+
+
+    # 提取部分数据集，采样
+    # export_from_loader(
+    #     train_loader,
+    #     save_dir=os.path.join(opts.save_dir, "debug_samples"),
+    #     num_batches=1,
+    #     max_samples_per_batch=2
+    # )
+    # print("Samples exported, exiting for inspection.")
+    # exit(0)
+
+
     model, infonce = load_model(opts)
     optimizer = load_optimizer(model, opts)
 
@@ -460,6 +528,21 @@ if __name__ == '__main__':
         print("Running in test-only mode")
         evaluate(model, train_loader_score, test_loader_int, test_loader_ext, opts,
                  epoch=start_epoch - 1, writer=writer)
+
+        export_repr(
+            model,
+            test_loader_int,
+            opts,
+            save_path=os.path.join(save_dir, "repr_internal.npz")
+        )
+
+        export_repr(
+            model,
+            test_loader_ext,
+            opts,
+            save_path=os.path.join(save_dir, "repr_external.npz")
+        )
+
         writer.close()
         logger.close()
         sys.stdout = logger.console

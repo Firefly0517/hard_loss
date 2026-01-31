@@ -39,57 +39,139 @@ class HardnessAwareKernelizedSupCon(nn.Module):
             raise ValueError(f"Unsupported distance metric: {self.distance_metric}")
         return dist
 
-    def forward(self, features, labels):
+    def forward(self, features, labels=None):
+        """
+        Hard-aware y-aware Supervised Contrastive Loss
+
+        Args:
+            features: Tensor [bsz, n_views, dim]
+            labels:   Tensor [bsz]
+        Returns:
+            loss: scalar
+        """
         device = features.device
 
-        if features.dim() != 3:
-            raise ValueError("features must be [bsz, n_views, dim]")
+        if len(features.shape) != 3:
+            raise ValueError(
+                '`features` needs to be [bsz, n_views, dim]'
+            )
 
-        bsz, n_views, dim = features.shape
-        labels = labels.view(bsz, 1)
+        batch_size, n_views, dim = features.shape
 
-        # normalize & flatten views
-        features = F.normalize(features, dim=-1)
-        feats = torch.cat(torch.unbind(features, dim=1), dim=0)  # [N, D]
-        labels = labels.repeat(n_views, 1)  # [N, 1]
-        N = feats.size(0)
+        # -------------------------------
+        # handle labels / kernel mask
+        # -------------------------------
+        if labels is None:
+            # SimCLR case
+            mask = torch.eye(batch_size, device=device)
+        else:
+            labels = labels.view(-1, 1)
+            if labels.shape[0] != batch_size:
+                raise ValueError('Num of labels does not match num of features')
 
-        # mask self-contrast
-        logits_mask = torch.ones((N, N), device=device)
-        logits_mask.fill_diagonal_(0.)
+            if self.kernel is None:
+                # SupCon (discrete labels)
+                mask = torch.eq(labels, labels.T).float()
+            else:
+                # y-aware kernel
+                mask = self.kernel(labels).clamp(0., 1.)
 
-        # -------- y-aware kernel weight (positives only) --------
-        w = self.kernel(labels).clamp(0., 1.)  # [N, N]
+        # -------------------------------
+        # flatten multi-view features
+        # -------------------------------
+        view_count = n_views
+        features = torch.cat(torch.unbind(features, dim=1), dim=0)  # [N, D]
+        N = features.shape[0]
 
-        # -------- hardness: inconsistency u = d_z - d_y --------
-        d_y = torch.abs(labels - labels.T)
-        d_y = d_y / (d_y.max() + self.eps)
+        # repeat labels for views
+        if labels is not None:
+            labels_all = labels.repeat(view_count, 1)  # [N, 1]
+        else:
+            labels_all = None
 
-        d_z = self.pairwise_distance(feats)
-        d_z = d_z / (d_z.max() + self.eps)
+        # repeat mask for multi-view
+        mask = mask.repeat(view_count, view_count)  # [N, N]
 
-        u = torch.clamp(d_z - d_y, -self.hmax, self.hmax)
+        # remove self-contrast
+        inv_diagonal = torch.ones_like(mask)
+        inv_diagonal.fill_diagonal_(0.)
 
-        # -------- hard-aware positive modulation --------
-        m = 1.0 + self.lambda_hard * F.relu(u)
+        # -------------------------------
+        # similarity logits
+        # -------------------------------
+        features = F.normalize(features, dim=1)
+        logits = torch.matmul(features, features.T) / self.temperature
 
-        # final positive weights (THIS is the key)
-        # w_pos = (w * m) * logits_mask
-        w_pos = w
-        # -------- InfoNCE logits (standard) --------
-        sim = torch.matmul(feats, feats.T) / self.temperature
-        logits_max, _ = torch.max(sim, dim=1, keepdim=True)
-        logits = sim - logits_max.detach()
+        # numerical stability
+        logits_max, _ = torch.max(logits, dim=1, keepdim=True)
+        logits = logits - logits_max.detach()
 
-        exp_logits = torch.exp(logits) * logits_mask
-        log_denom = torch.log(exp_logits.sum(dim=1, keepdim=True) + self.eps)
-        log_prob = logits - log_denom  # [N, N]
+        alignment = logits
 
-        # -------- y-aware expectation over positives --------
-        w_pos_sum = w_pos.sum(dim=1).clamp(min=self.eps)
-        mean_log_prob_pos = (w_pos * log_prob).sum(dim=1) / w_pos_sum
+        # -------------------------------
+        # denominator (uniformity)
+        # -------------------------------
+        uniformity = torch.exp(logits) * inv_diagonal
 
-        loss = -(self.temperature / self.base_temperature) * mean_log_prob_pos
+        # if self.method == 'threshold':
+        #     repeated = mask.unsqueeze(-1).repeat(1, 1, mask.shape[0])
+        #     delta = (mask[:, None].T - repeated.T).transpose(1, 2)
+        #     delta = (delta > 0.).float()
+        #
+        #     uniformity = uniformity.unsqueeze(-1).repeat(1, 1, mask.shape[0])
+        #     if self.delta_reduction == 'mean':
+        #         uniformity = (uniformity * delta).mean(-1)
+        #     else:
+        #         uniformity = (uniformity * delta).sum(-1)
+        #
+        # elif self.method == 'expw':
+        #     uniformity = torch.exp(logits * (1 - mask)) * inv_diagonal
+
+        uniformity = torch.log(uniformity.sum(1, keepdim=True) + 1e-8)
+
+        # -------------------------------
+        # HARD-AWARE PART (new)
+        # -------------------------------
+        if labels_all is not None and self.lambda_hard > 0:
+            # label distance
+            d_y = torch.abs(labels_all - labels_all.T)
+            d_y = d_y / (d_y.max() + 1e-8)
+
+            # representation distance (cosine)
+            sim = torch.matmul(features, features.T)
+            d_z = 1.0 - sim
+            d_z = d_z / (d_z.max() + 1e-8)
+
+            # inconsistency
+            u = torch.clamp(d_z - d_y, -self.hmax, self.hmax)
+
+            # hard-aware modulation
+            m = 1.0 + self.lambda_hard * F.relu(u)
+        else:
+            m = None
+
+        # -------------------------------
+        # positive distribution
+        # -------------------------------
+        if m is not None:
+            positive_mask = mask * m * inv_diagonal
+        else:
+            positive_mask = mask * inv_diagonal
+
+        # -------------------------------
+        # log-probability
+        # -------------------------------
+        log_prob = alignment - uniformity
+
+        pos_sum = positive_mask.sum(1)
+        pos_sum = pos_sum.clamp(min=1e-8)
+
+        mean_log_prob_pos = (positive_mask * log_prob).sum(1) / pos_sum
+
+        # -------------------------------
+        # loss
+        # -------------------------------
+        loss = - (self.temperature / self.base_temperature) * mean_log_prob_pos
         return loss.mean()
 
 

@@ -2,6 +2,7 @@ import numpy as np
 import operator
 import random
 import torch
+from scipy.ndimage import zoom
 
 class Crop(object):
     """ Crop the given n-dimensional array either at a random location or
@@ -146,6 +147,57 @@ class Pad(object):
         fill_arr = np.pad(arr, padding, **self.kwargs)
         return fill_arr
 
+def isotropic_resample_to_128(x):
+    """
+    x: numpy array, shape (1, D, H, W)
+    return: numpy array, shape (1, 128, 128, 128)
+    """
+    assert x.ndim == 4 and x.shape[0] == 1
+
+    _, D, H, W = x.shape
+    target = 128
+
+    # 等比例缩放因子
+    scale = target / max(D, H, W)
+
+    # zoom factor：channel 不缩放
+    zoom_factors = (1.0, scale, scale, scale)
+
+    # order=1：线性插值（推荐）
+    x_resampled = zoom(
+        x,
+        zoom=zoom_factors,
+        order=1,          # linear interpolation
+        mode='constant',
+        cval=0.0,
+        prefilter=False
+    )
+
+    # --- 保证最终是 128³（防止 rounding 问题） ---
+    _, d, h, w = x_resampled.shape
+
+    def center_crop_or_pad(arr, target):
+        out = np.zeros((1, target, target, target), dtype=arr.dtype)
+
+        d0 = min(d, target)
+        h0 = min(h, target)
+        w0 = min(w, target)
+
+        sd = (d - d0) // 2
+        sh = (h - h0) // 2
+        sw = (w - w0) // 2
+
+        td = (target - d0) // 2
+        th = (target - h0) // 2
+        tw = (target - w0) // 2
+
+        out[:, td:td+d0, th:th+h0, tw:tw+w0] = \
+            arr[:, sd:sd+d0, sh:sh+h0, sw:sw+w0]
+
+        return out
+
+    x_final = center_crop_or_pad(x_resampled, target)
+    return x_final
 
 if __name__ == '__main__':
     import timeit
