@@ -3,7 +3,7 @@ data_dir: /data2/wangchangmiao/liuxiaoshuai/openBHB
 
 # 选择可视化的数据划分
 # 可选: train / test_internal / test_external
-split: train
+split: test_internal
 
 ckpt: /data2/wangchangmiao/liuxiaoshuai/csbrain/output/openbhb_models/y_aware_experiment_rbf/latest_ckpt.pth
 model: resnet18
